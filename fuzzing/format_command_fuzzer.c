@@ -1,8 +1,7 @@
-/* Extracted from anet.c to work properly with Hiredis error reporting.
- *
- * Copyright (c) 2009-2011, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2010-2014, Pieter Noordhuis <pcnoordhuis at gmail dot com>
- * Copyright (c) 2015, Matt Stancliff <matt at genges dot com>,
+/*
+ * Copyright (c) 2020, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2020, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+ * Copyright (c) 2020, Matt Stancliff <matt at genges dot com>,
  *                     Jan-Erik Rediger <janerik at fnordig dot com>
  *
  * All rights reserved.
@@ -32,25 +31,27 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef __NET_H
-#define __NET_H
-
+#include <stdlib.h>
+#include <string.h>
 #include "hiredis.h"
 
-void redisNetClose(redisContext *c);
-ssize_t redisNetRead(redisContext *c, char *buf, size_t bufcap);
-ssize_t redisNetWrite(redisContext *c);
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    char *new_str, *cmd;
 
-int redisCheckSocketError(redisContext *c);
-int redisContextSetTimeout(redisContext *c, const struct timeval tv);
-int redisContextConnectTcp(redisContext *c, const char *addr, int port, const struct timeval *timeout);
-int redisContextConnectBindTcp(redisContext *c, const char *addr, int port,
-                               const struct timeval *timeout,
-                               const char *source_addr);
-int redisContextConnectUnix(redisContext *c, const char *path, const struct timeval *timeout);
-int redisKeepAlive(redisContext *c, int interval);
-int redisCheckConnectDone(redisContext *c, int *completed);
+    if (size < 3)
+        return 0;
 
-int redisSetTcpNoDelay(redisContext *c);
+    new_str = malloc(size+1);
+    if (new_str == NULL)
+        return 0;
 
-#endif
+    memcpy(new_str, data, size);
+    new_str[size] = '\0';
+
+    redisFormatCommand(&cmd, new_str);
+
+    if (cmd != NULL)
+        hi_free(cmd);
+    free(new_str);
+    return 0;
+}

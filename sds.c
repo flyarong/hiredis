@@ -36,6 +36,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 #include "sds.h"
 #include "sdsalloc.h"
 
@@ -71,7 +72,7 @@ static inline char sdsReqType(size_t string_size) {
  * and 'initlen'.
  * If NULL is used for 'init' the string is initialized with zero bytes.
  *
- * The string is always null-termined (all the sds strings are, always) so
+ * The string is always null-terminated (all the sds strings are, always) so
  * even if you create an sds string with:
  *
  * mystring = sdsnewlen("abc",3);
@@ -414,7 +415,7 @@ sds sdscpylen(sds s, const char *t, size_t len) {
     return s;
 }
 
-/* Like sdscpylen() but 't' must be a null-termined string so that the length
+/* Like sdscpylen() but 't' must be a null-terminated string so that the length
  * of the string is obtained with strlen(). */
 sds sdscpy(sds s, const char *t) {
     return sdscpylen(s, t, strlen(t));
@@ -713,15 +714,20 @@ sds sdstrim(sds s, const char *cset) {
  *
  * The string is modified in-place.
  *
+ * Return value:
+ * -1 (error) if sdslen(s) is larger than maximum positive ssize_t value.
+ *  0 on success.
+ *
  * Example:
  *
  * s = sdsnew("Hello World");
  * sdsrange(s,1,-1); => "ello World"
  */
-void sdsrange(sds s, int start, int end) {
+int sdsrange(sds s, ssize_t start, ssize_t end) {
     size_t newlen, len = sdslen(s);
+    if (len > SSIZE_MAX) return -1;
 
-    if (len == 0) return;
+    if (len == 0) return 0;
     if (start < 0) {
         start = len+start;
         if (start < 0) start = 0;
@@ -732,9 +738,9 @@ void sdsrange(sds s, int start, int end) {
     }
     newlen = (start > end) ? 0 : (end-start)+1;
     if (newlen != 0) {
-        if (start >= (signed)len) {
+        if (start >= (ssize_t)len) {
             newlen = 0;
-        } else if (end >= (signed)len) {
+        } else if (end >= (ssize_t)len) {
             end = len-1;
             newlen = (start > end) ? 0 : (end-start)+1;
         }
@@ -744,6 +750,7 @@ void sdsrange(sds s, int start, int end) {
     if (start && newlen) memmove(s, s+start, newlen);
     s[newlen] = 0;
     sdssetlen(s,newlen);
+    return 0;
 }
 
 /* Apply tolower() to every character of the sds string 's'. */

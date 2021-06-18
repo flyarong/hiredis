@@ -44,8 +44,11 @@
 #include "async.h"
 #include "win32.h"
 
+extern int redisContextUpdateConnectTimeout(redisContext *c, const struct timeval *timeout);
+extern int redisContextUpdateCommandTimeout(redisContext *c, const struct timeval *timeout);
+
 static redisContextFuncs redisContextDefaultFuncs = {
-    .free_privdata = NULL,
+    .free_privctx = NULL,
     .async_read = redisAsyncRead,
     .async_write = redisAsyncWrite,
     .read = redisNetRead,
@@ -93,6 +96,8 @@ void freeReplyObject(void *reply) {
 
     switch(r->type) {
     case REDIS_REPLY_INTEGER:
+    case REDIS_REPLY_NIL:
+    case REDIS_REPLY_BOOL:
         break; /* Nothing to free */
     case REDIS_REPLY_ARRAY:
     case REDIS_REPLY_MAP:
@@ -109,6 +114,7 @@ void freeReplyObject(void *reply) {
     case REDIS_REPLY_STRING:
     case REDIS_REPLY_DOUBLE:
     case REDIS_REPLY_VERB:
+    case REDIS_REPLY_BIGNUM:
         hi_free(r->str);
         break;
     }
@@ -126,7 +132,8 @@ static void *createStringObject(const redisReadTask *task, char *str, size_t len
     assert(task->type == REDIS_REPLY_ERROR  ||
            task->type == REDIS_REPLY_STATUS ||
            task->type == REDIS_REPLY_STRING ||
-           task->type == REDIS_REPLY_VERB);
+           task->type == REDIS_REPLY_VERB   ||
+           task->type == REDIS_REPLY_BIGNUM);
 
     /* Copy string value */
     if (task->type == REDIS_REPLY_VERB) {
@@ -184,7 +191,8 @@ static void *createArrayObject(const redisReadTask *task, size_t elements) {
         parent = task->parent->obj;
         assert(parent->type == REDIS_REPLY_ARRAY ||
                parent->type == REDIS_REPLY_MAP ||
-               parent->type == REDIS_REPLY_SET);
+               parent->type == REDIS_REPLY_SET ||
+               parent->type == REDIS_REPLY_PUSH);
         parent->element[task->idx] = r;
     }
     return r;
@@ -231,12 +239,14 @@ static void *createDoubleObject(const redisReadTask *task, double value, char *s
      * decimal string conversion artifacts. */
     memcpy(r->str, str, len);
     r->str[len] = '\0';
+    r->len = len;
 
     if (task->parent) {
         parent = task->parent->obj;
         assert(parent->type == REDIS_REPLY_ARRAY ||
                parent->type == REDIS_REPLY_MAP ||
-               parent->type == REDIS_REPLY_SET);
+               parent->type == REDIS_REPLY_SET ||
+               parent->type == REDIS_REPLY_PUSH);
         parent->element[task->idx] = r;
     }
     return r;
@@ -253,7 +263,8 @@ static void *createNilObject(const redisReadTask *task) {
         parent = task->parent->obj;
         assert(parent->type == REDIS_REPLY_ARRAY ||
                parent->type == REDIS_REPLY_MAP ||
-               parent->type == REDIS_REPLY_SET);
+               parent->type == REDIS_REPLY_SET ||
+               parent->type == REDIS_REPLY_PUSH);
         parent->element[task->idx] = r;
     }
     return r;
@@ -272,7 +283,8 @@ static void *createBoolObject(const redisReadTask *task, int bval) {
         parent = task->parent->obj;
         assert(parent->type == REDIS_REPLY_ARRAY ||
                parent->type == REDIS_REPLY_MAP ||
-               parent->type == REDIS_REPLY_SET);
+               parent->type == REDIS_REPLY_SET ||
+               parent->type == REDIS_REPLY_PUSH);
         parent->element[task->idx] = r;
     }
     return r;
@@ -679,7 +691,12 @@ redisReader *redisReaderCreate(void) {
     return redisReaderCreateWithFunctions(&defaultFunctions);
 }
 
-static redisContext *redisContextInit(const redisOptions *options) {
+static void redisPushAutoFree(void *privdata, void *reply) {
+    (void)privdata;
+    freeReplyObject(reply);
+}
+
+static redisContext *redisContextInit(void) {
     redisContext *c;
 
     c = hi_calloc(1, sizeof(*c));
@@ -687,6 +704,7 @@ static redisContext *redisContextInit(const redisOptions *options) {
         return NULL;
 
     c->funcs = &redisContextDefaultFuncs;
+
     c->obuf = sdsempty();
     c->reader = redisReaderCreate();
     c->fd = REDIS_INVALID_FD;
@@ -695,7 +713,7 @@ static redisContext *redisContextInit(const redisOptions *options) {
         redisFree(c);
         return NULL;
     }
-    (void)options; /* options are used in other functions */
+
     return c;
 }
 
@@ -709,11 +727,16 @@ void redisFree(redisContext *c) {
     hi_free(c->tcp.host);
     hi_free(c->tcp.source_addr);
     hi_free(c->unix_sock.path);
-    hi_free(c->timeout);
+    hi_free(c->connect_timeout);
+    hi_free(c->command_timeout);
     hi_free(c->saddr);
-    if (c->funcs->free_privdata) {
-        c->funcs->free_privdata(c->privdata);
-    }
+
+    if (c->privdata && c->free_privdata)
+        c->free_privdata(c->privdata);
+
+    if (c->funcs->free_privctx)
+        c->funcs->free_privctx(c->privctx);
+
     memset(c, 0xff, sizeof(*c));
     hi_free(c);
 }
@@ -729,9 +752,9 @@ int redisReconnect(redisContext *c) {
     c->err = 0;
     memset(c->errstr, '\0', strlen(c->errstr));
 
-    if (c->privdata && c->funcs->free_privdata) {
-        c->funcs->free_privdata(c->privdata);
-        c->privdata = NULL;
+    if (c->privctx && c->funcs->free_privctx) {
+        c->funcs->free_privctx(c->privctx);
+        c->privctx = NULL;
     }
 
     redisNetClose(c);
@@ -747,22 +770,28 @@ int redisReconnect(redisContext *c) {
         return REDIS_ERR;
     }
 
+    int ret = REDIS_ERR;
     if (c->connection_type == REDIS_CONN_TCP) {
-        return redisContextConnectBindTcp(c, c->tcp.host, c->tcp.port,
-                c->timeout, c->tcp.source_addr);
+        ret = redisContextConnectBindTcp(c, c->tcp.host, c->tcp.port,
+               c->connect_timeout, c->tcp.source_addr);
     } else if (c->connection_type == REDIS_CONN_UNIX) {
-        return redisContextConnectUnix(c, c->unix_sock.path, c->timeout);
+        ret = redisContextConnectUnix(c, c->unix_sock.path, c->connect_timeout);
     } else {
         /* Something bad happened here and shouldn't have. There isn't
            enough information in the context to reconnect. */
         __redisSetError(c,REDIS_ERR_OTHER,"Not enough information to reconnect");
+        ret = REDIS_ERR;
     }
 
-    return REDIS_ERR;
+    if (c->command_timeout != NULL && (c->flags & REDIS_BLOCK) && c->fd != REDIS_INVALID_FD) {
+        redisContextSetTimeout(c, *c->command_timeout);
+    }
+
+    return ret;
 }
 
 redisContext *redisConnectWithOptions(const redisOptions *options) {
-    redisContext *c = redisContextInit(options);
+    redisContext *c = redisContextInit();
     if (c == NULL) {
         return NULL;
     }
@@ -773,16 +802,32 @@ redisContext *redisConnectWithOptions(const redisOptions *options) {
         c->flags |= REDIS_REUSEADDR;
     }
     if (options->options & REDIS_OPT_NOAUTOFREE) {
-      c->flags |= REDIS_NO_AUTO_FREE;
+        c->flags |= REDIS_NO_AUTO_FREE;
+    }
+
+    /* Set any user supplied RESP3 PUSH handler or use freeReplyObject
+     * as a default unless specifically flagged that we don't want one. */
+    if (options->push_cb != NULL)
+        redisSetPushCallback(c, options->push_cb);
+    else if (!(options->options & REDIS_OPT_NO_PUSH_AUTOFREE))
+        redisSetPushCallback(c, redisPushAutoFree);
+
+    c->privdata = options->privdata;
+    c->free_privdata = options->free_privdata;
+
+    if (redisContextUpdateConnectTimeout(c, options->connect_timeout) != REDIS_OK ||
+        redisContextUpdateCommandTimeout(c, options->command_timeout) != REDIS_OK) {
+        __redisSetError(c, REDIS_ERR_OOM, "Out of memory");
+        return c;
     }
 
     if (options->type == REDIS_CONN_TCP) {
         redisContextConnectBindTcp(c, options->endpoint.tcp.ip,
-                                   options->endpoint.tcp.port, options->timeout,
+                                   options->endpoint.tcp.port, options->connect_timeout,
                                    options->endpoint.tcp.source_addr);
     } else if (options->type == REDIS_CONN_UNIX) {
         redisContextConnectUnix(c, options->endpoint.unix_socket,
-                                options->timeout);
+                                options->connect_timeout);
     } else if (options->type == REDIS_CONN_USERFD) {
         c->fd = options->endpoint.fd;
         c->flags |= REDIS_CONNECTED;
@@ -790,9 +835,11 @@ redisContext *redisConnectWithOptions(const redisOptions *options) {
         // Unknown type - FIXME - FREE
         return NULL;
     }
-    if (options->timeout != NULL && (c->flags & REDIS_BLOCK) && c->fd != REDIS_INVALID_FD) {
-        redisContextSetTimeout(c, *options->timeout);
+
+    if (options->command_timeout != NULL && (c->flags & REDIS_BLOCK) && c->fd != REDIS_INVALID_FD) {
+        redisContextSetTimeout(c, *options->command_timeout);
     }
+
     return c;
 }
 
@@ -808,7 +855,7 @@ redisContext *redisConnect(const char *ip, int port) {
 redisContext *redisConnectWithTimeout(const char *ip, int port, const struct timeval tv) {
     redisOptions options = {0};
     REDIS_OPTIONS_SET_TCP(&options, ip, port);
-    options.timeout = &tv;
+    options.connect_timeout = &tv;
     return redisConnectWithOptions(&options);
 }
 
@@ -846,7 +893,7 @@ redisContext *redisConnectUnix(const char *path) {
 redisContext *redisConnectUnixWithTimeout(const char *path, const struct timeval tv) {
     redisOptions options = {0};
     REDIS_OPTIONS_SET_UNIX(&options, path);
-    options.timeout = &tv;
+    options.connect_timeout = &tv;
     return redisConnectWithOptions(&options);
 }
 
@@ -878,6 +925,13 @@ int redisEnableKeepAlive(redisContext *c) {
     return REDIS_OK;
 }
 
+/* Set a user provided RESP3 PUSH handler and return any old one set. */
+redisPushFn *redisSetPushCallback(redisContext *c, redisPushFn *fn) {
+    redisPushFn *old = c->push_cb;
+    c->push_cb = fn;
+    return old;
+}
+
 /* Use this function to handle a read event on the descriptor. It will try
  * and read some bytes from the socket and feed them to the reply parser.
  *
@@ -892,13 +946,11 @@ int redisBufferRead(redisContext *c) {
         return REDIS_ERR;
 
     nread = c->funcs->read(c, buf, sizeof(buf));
-    if (nread > 0) {
-        if (redisReaderFeed(c->reader, buf, nread) != REDIS_OK) {
-            __redisSetError(c, c->reader->err, c->reader->errstr);
-            return REDIS_ERR;
-        } else {
-        }
-    } else if (nread < 0) {
+    if (nread < 0) {
+        return REDIS_ERR;
+    }
+    if (nread > 0 && redisReaderFeed(c->reader, buf, nread) != REDIS_OK) {
+        __redisSetError(c, c->reader->err, c->reader->errstr);
         return REDIS_ERR;
     }
     return REDIS_OK;
@@ -920,17 +972,17 @@ int redisBufferWrite(redisContext *c, int *done) {
         return REDIS_ERR;
 
     if (sdslen(c->obuf) > 0) {
-        int nwritten = c->funcs->write(c);
+        ssize_t nwritten = c->funcs->write(c);
         if (nwritten < 0) {
             return REDIS_ERR;
         } else if (nwritten > 0) {
-            if (nwritten == (signed)sdslen(c->obuf)) {
+            if (nwritten == (ssize_t)sdslen(c->obuf)) {
                 sdsfree(c->obuf);
                 c->obuf = sdsempty();
                 if (c->obuf == NULL)
                     goto oom;
             } else {
-                sdsrange(c->obuf,nwritten,-1);
+                if (sdsrange(c->obuf,nwritten,-1) < 0) goto oom;
             }
         }
     }
@@ -942,13 +994,36 @@ oom:
     return REDIS_ERR;
 }
 
-/* Internal helper function to try and get a reply from the reader,
- * or set an error in the context otherwise. */
+/* Internal helper that returns 1 if the reply was a RESP3 PUSH
+ * message and we handled it with a user-provided callback. */
+static int redisHandledPushReply(redisContext *c, void *reply) {
+    if (reply && c->push_cb && redisIsPushReply(reply)) {
+        c->push_cb(c->privdata, reply);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Get a reply from our reader or set an error in the context. */
 int redisGetReplyFromReader(redisContext *c, void **reply) {
-    if (redisReaderGetReply(c->reader,reply) == REDIS_ERR) {
+    if (redisReaderGetReply(c->reader, reply) == REDIS_ERR) {
         __redisSetError(c,c->reader->err,c->reader->errstr);
         return REDIS_ERR;
     }
+
+    return REDIS_OK;
+}
+
+/* Internal helper to get the next reply from our reader while handling
+ * any PUSH messages we encounter along the way.  This is separate from
+ * redisGetReplyFromReader so as to not change its behavior. */
+static int redisNextInBandReplyFromReader(redisContext *c, void **reply) {
+    do {
+        if (redisGetReplyFromReader(c, reply) == REDIS_ERR)
+            return REDIS_ERR;
+    } while (redisHandledPushReply(c, *reply));
+
     return REDIS_OK;
 }
 
@@ -957,7 +1032,7 @@ int redisGetReply(redisContext *c, void **reply) {
     void *aux = NULL;
 
     /* Try to read pending replies */
-    if (redisGetReplyFromReader(c,&aux) == REDIS_ERR)
+    if (redisNextInBandReplyFromReader(c,&aux) == REDIS_ERR)
         return REDIS_ERR;
 
     /* For the blocking context, flush output buffer and read reply */
@@ -972,7 +1047,8 @@ int redisGetReply(redisContext *c, void **reply) {
         do {
             if (redisBufferRead(c) == REDIS_ERR)
                 return REDIS_ERR;
-            if (redisGetReplyFromReader(c,&aux) == REDIS_ERR)
+
+            if (redisNextInBandReplyFromReader(c,&aux) == REDIS_ERR)
                 return REDIS_ERR;
         } while (aux == NULL);
     }
